@@ -16,40 +16,109 @@ Retyping a change is exactly how the two drift; one reflowed line or reworded cl
 
 ## What this repo is
 
-`scaffold` is a **GitHub template repository**, not an application. It ships the meta layer (lint, format, commit hooks, CI, CodeQL, Dependabot, release-please, issue/PR templates, standard meta docs) that every new kirchDev repo should start with. There is no application code — the project code can be anything (PHP, Go, Rust, Vue, shell). Only the meta layer lives here.
+A first-party **OpenTofu / Terraform provider for [TCPShield](https://tcpshield.com)** (DDoS protection for Minecraft and other game servers), owned by kirchDev. It covers the complete [TCPShield REST API](https://swagger.tcpshield.com/) — networks, backend sets, domains, the IP/ASN/country firewalls, Bedrock tunnels, Sentry tunnels and their firewall rules, plus the account.
 
-Implication: when changing files, ask "does this default make sense for _every_ future repo created from this template?" — not just for one project type.
+- **Provider type (HCL):** `tcpshield` → `provider "tcpshield" {}`
+- **OpenTofu registry address:** `kirchdev/tcpshield`
+- **Go module:** `github.com/kirchDev/terraform-provider-tcpshield`
+- **SDK:** `terraform-plugin-framework` (NOT the legacy SDKv2)
+
+The repo name format `NAMESPACE/terraform-provider-NAME` is **mandatory** for the OpenTofu/Terraform registry — it's not a style choice.
+
+**Deliberately left out:** `PATCH /user/email` and `POST /user/password` (credentials don't belong in state), `GET /user/apikey` (the provider already holds it — exposing it copies a secret into state), `POST /user/apikey/regenerate` (invalidates the provider's own key mid-apply). Don't add them without a conversation.
+
+## Current state
+
+10 resources and 24 data sources, every spec endpoint mapped. Verification differs by area:
+
+- **Live-verified (2026-10)** — `TestLiveNetworkLifecycle` runs create → update → import → destroy against the real API for networks (every setting except `webhook_url` and `verification_server`), backend sets, domains and all three firewalls, and reads every network-scoped data source plus `tcpshield_domain_preverify` / `tcpshield_domain_verification` along the way. `TestLiveUserProfile` renames the account and puts the name back; it never touches the phone (see below) and skips on an account without one.
+- **Plan-gated, mock-only** (per [tcpshield.com/plans](https://tcpshield.com/plans); the test account is Pro) — Bedrock tunnels need Geyser support (Premium+; Pro answers `You cannot add any more bedrock tunnels.`), `tcpshield_analytics` needs advanced analytics (Premium+; Pro answers 403), `verification_server` is Enterprise only.
+- **Mock-only, cause unknown** — Sentry tunnels + their firewall rules and the tunnel-scoped data sources: creation failed server-side on the test account (`Allocating not used IP address failed.`); the plans page does not mention Sentry at all.
+- `webhook_url` needs a real Discord/Slack webhook to test.
+- The README's _Test status_ table is the user-facing version of this list — keep the two in step. `TestEveryTypeIsCoveredByAMockTest` fails when a resource or data source appears in no acceptance-test configuration.
+
+Two layers coexist:
+
+- **Node meta layer** (from the `scaffold` template): pnpm + oxlint + oxfmt + husky + commitlint + release-please + CI/CodeQL/Dependabot + issue/PR templates. Gates config/docs (JSON/YAML/MD).
+- **Go provider**: `internal/client/` (the REST client) and `internal/provider/` (resources, data sources, tests).
+
+## API shape (verified against the live API, 2026-10)
+
+The published OpenAPI spec is loose — several single reads are documented as arrays and most writes as "200, no body". What the API really does:
+
+- Base `https://api.tcpshield.com`, auth header **`X-API-Key`**. Plain JSON, no envelope — except `/user/summary` (`{"data": …}`) and **creates**, which answer `{"data": {"id": n}, "message": …, "status": 0}`. `client.CreatedID` tolerates every shape; when no id comes back the resource falls back to `findNewest` (list + match, highest id).
+- **Errors** are `{"error": "…"}` with a real status (404 for a missing entity). Validation errors put an **object** in `error` (`{"UpdateDomainRequest.Name": "Name is a required field"}`); `errorMessage` renders it as sorted `field: message` pairs. An empty collection may come back as `null`.
+- **Backend sets:** the listing has no `backends`, the single read has `backends` but **no `id`** — `fill` takes the id from the request path, and `tcpshield_backend_sets` reads each set once more. The **PATCH is a PUT**: a field left out resets to its zero value (`load_balancing_mode` → 0) and a body without `backends` is answered "identical, no update necessary" and ignored — so create and update send the whole set.
+- **Domains** and **Bedrock tunnels:** PATCH requires every field (`name`, `backend_set_id`, `bac` / the full create body) — always send all.
+- **Networks:** PATCH is truly partial, and every setting in the response is patchable. But it **silently ignores zero values** for the ints and for `mitigation_message` / `antivpn_kick_msg` — sending one leaves the old value live and fails the apply with an inconsistent result. Validators (1–100, 1–3600, 1–600, non-empty) turn that into a plan-time error. Booleans and the `offline_*` texts _can_ be reset to `false`/`""`. `webhook_url` must be Discord or Slack; `verification_server` is plan-gated. `POST /networks` is limited by plan (Pro: one network).
+- **Firewalls** have no single read and no update: read through the list, every attribute `RequiresReplace`. The IP firewall wants real CIDR (a bare IP is a 500 `Invalid Cidr formatting`) and keeps host bits as written; `cidrValidator` checks at plan time. The country create response carries `country_id: 0`, the list the resolved code/name — always read back from the list.
+- **Domain (pre)verification** answers **403** `Failed to verify domain.` when DNS is not set up. The data sources report that as `verified = false`, not as an error.
+- **Sentry tunnel** update is a PUT requiring `name`, `endpoint_public_key`, `endpoint_peer`, `bind_port`; `location` is create-only. `/tunnels/getBindPort` returns a bare number that changes on every call.
+- **`/user/updateGeneralInfo`** requires `firstname`, `lastname` and `phone` on every call and refuses an empty one (`UpdateUserGeneralSettings.PhoneNumber: PhoneNumber is a required field`) — `""`, `null` and leaving it out all fail. A phone number, once set, **cannot be removed through the API**; all three attributes are Required + non-empty. Never let a test set a phone it cannot take back.
+- **DELETE of a missing entity** is a 404; `client.Delete` treats it as success.
+- **Plan limits** surface only at apply: networks (Pro 1, Premium 3, Enterprise 10), IP firewall entries (Pro 5, Enterprise 50), Bedrock tunnels, analytics and the verification server. The descriptions name them; the provider does not know the account's plan.
+- Rate limits are undocumented; the client retries `429` (honouring `Retry-After`) and `5xx` on reads only — a write that 5xx'd may have landed.
 
 ## Commands
 
-| Command             | What it does                                               |
-| :------------------ | :--------------------------------------------------------- |
-| `pnpm install`      | Install deps and wire husky hooks via the `prepare` script |
-| `pnpm lint`         | `oxlint . --deny-warnings`                                 |
-| `pnpm format`       | `oxfmt --check .` (note: `format` is the check, not fix)   |
-| `pnpm typecheck`    | `tsc --noEmit` over the meta scripts                       |
-| `pnpm check`        | Runs `lint` + `format` + `typecheck` + `check:policy` — the CI gate |
-| `pnpm check:policy` | Proves the two agent policy files ban the same commands    |
-| `pnpm lint:fix`     | Auto-fix lint                                              |
-| `pnpm format:fix`   | Auto-fix format                                            |
-| `pnpm check:fix`    | Auto-fix lint + format                                     |
-| `pnpm skills:update`| Update project-scoped agent skills via the skills.sh CLI   |
-| `pnpm taze`         | Interactive dependency upgrade check                       |
-| `pnpm taze:w`       | Write upgrade results                                      |
+Go (via `GNUmakefile`; needs **Go ≥ 1.25** — `terraform-plugin-framework v1.19` requires it):
 
-There is no test suite — this is config-only. CI runs `pnpm lint`, `pnpm format`, `pnpm typecheck` and `pnpm check:policy` on PR.
+| Command        | What it does                                                                |
+| :------------- | :-------------------------------------------------------------------------- |
+| `make build`   | `go build -o terraform-provider-tcpshield`                                  |
+| `make tidy`    | `go mod tidy`                                                               |
+| `make fmt`     | `gofmt -s -w .`                                                             |
+| `make vet`     | `go vet ./...`                                                              |
+| `make lint`    | `golangci-lint run`                                                         |
+| `make docs`    | render `docs/` from the schema (build + export + tfplugindocs)              |
+| `make test`    | `go test ./...` — client unit tests, examples coverage                      |
+| `make testacc` | `TF_ACC=1 go test ./...` — mock acceptance tests; needs a TF binary, no key |
 
-## Architecture / conventions
+**Live tests** (real API, real entities — a whole network is created and destroyed; needs an account with a free network slot):
 
-- **Node 24, pnpm 11.** Pinned via `.nvmrc`, `engines`, and `packageManager`. `pnpm-workspace.yaml` enforces `minimumReleaseAge=4320` (3-day cooldown), isolated node-linker. Don't loosen these without reason. Package-manager enforcement carries no key on purpose: pnpm 11 replaced `packageManagerStrict`/`packageManagerStrictVersion` with `pmOnFail`, whose default `download` already errors on a foreign package manager and fetches the pinned pnpm version — every other value only weakens it, so leave it unset (the rationale sits as a comment in the file).
-- **oxc, not eslint/prettier.** Linting via `oxlint`, formatting via `oxfmt`. Configs live in `.oxlintrc.json` / `.oxfmtrc.json`. `oxlint` uses `unicorn` + `oxc` plugins; rules deliberately minimal.
-- **TypeScript, no build step.** The meta scripts and the three tool configs are `.ts` — Node 24 strips types natively, so `scripts/check-policy-parity.ts`, `commitlint.config.ts`, `lint-staged.config.ts` and `taze.config.ts` stay directly executable and each tool loads its own `.ts` config unaided. `tsconfig.json` is `noEmit` + `strict` + `erasableSyntaxOnly`, so only strippable syntax (no enums, no parameter properties) can be written; `pnpm typecheck` is the gate. TypeScript is a devDependency of the template's meta layer only — a downstream PHP, Go or Rust repo inherits it for that and nothing else, and drops it by deleting `tsconfig.json`, the `typecheck` script and the four `.ts` files' types.
-- **Husky hooks** (`.husky/pre-commit`, `.husky/commit-msg`) run `lint-staged` and `commitlint`. `lint-staged.config.ts` excludes `README.md`, `CLAUDE.md`, and `AGENTS.md` (free-form prose) and `pnpm-lock.yaml`. `oxlint --fix --deny-warnings` then `oxfmt` on JS/TS; `oxfmt` only on JSON/YAML/MD.
-- **Conventional Commits enforced** via `@commitlint/config-conventional`. Don't `--no-verify` unless explicitly asked.
-- **release-please is included** (unlike many templates that omit it). Files: `release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release-please.yml`. Config uses `release-type: simple` (language-agnostic), `include-v-in-tag: true`. Downstream repos start at `0.0.0` and reset via the steps in README → _Resetting release-please_.
-- **Workflows** use `actions/checkout@v6`, `actions/setup-node@v6`, `pnpm/action-setup@v6`, `github/codeql-action/{init,analyze}@v4`. Keep these pinned to major versions; Dependabot bumps them monthly.
-- **CodeQL** scans `actions` + `javascript-typescript` with `security-extended,security-and-quality` queries, gated by path filters so non-code changes don't trigger it.
-- **Dependabot** groups all minor/patch updates per ecosystem into a single PR (`npm-minor-patch`, `actions-minor-patch`). Majors come as separate PRs.
+```bash
+TF_ACC=1 TCPSHIELD_LIVE=1 TCPSHIELD_API_KEY=… go test ./internal/provider -run TestLive -v
+```
+
+Node meta layer: `pnpm install` (wires husky hooks), `pnpm check` / `pnpm check:fix`. CI (`.github/workflows/ci.yml`) runs the central **Go job** (build·vet·gofmt·golangci-lint·test + `TF_ACC` mock acceptance tests) and the **check job** (`pnpm check`).
+
+> [!NOTE]
+> Generated files are excluded from oxfmt via `.prettierignore` (`docs/` from tfplugindocs, `CHANGELOG.md` from release-please). Don't reformat them — the next generation undoes it.
+
+## Patterns & gotchas
+
+- One file per entity (resource + its data sources), one `api*` wire struct and one `*Model`; constructors `New{Camel}Resource` / `New{Camel}DataSource`; TypeName `tcpshield_{snake}`; everything registered in `provider.go`. Data sources reuse the resource models.
+- `firewall_resource.go` serves all three firewalls from one implementation; a `firewallKind` names what differs.
+- **Ids are `Int64`**, import ids are `<parent_id>/<id>` (`parseImportID`). `tcpshield_user_profile` is a singleton: create adopts, delete forgets.
+- **Optional + Computed + `UseStateForUnknown`** on every setting: left out of the config, it keeps the live value and never plans as `(known after apply)`.
+- **State is never the write's answer** — every create/update reads the entity back. The write responses are inconsistent (nanosecond vs millisecond timestamps, `country_id: 0`).
+- `mock_test.go` reproduces every quirk above; when the live API surprises you, teach the mock first, then fix the provider. `TestAccMockNetworkLifecycle` runs the live test's configuration against it.
+- `examples_test.go` fails when a resource/data source has no example, or an example has no resource.
+
+### Manual smoke test (loads the binary in OpenTofu)
+
+```bash
+make build
+cat > /tmp/tcpshield.tfrc <<EOF
+provider_installation {
+  dev_overrides { "kirchdev/tcpshield" = "$(pwd)" }
+  direct {}
+}
+EOF
+TF_CLI_CONFIG_FILE=/tmp/tcpshield.tfrc tofu -chdir=path/to/example plan
+```
+
+## Release & publishing
+
+- **release-please** (`.github/workflows/release-please.yml`, `release-type: go`) owns versioning + CHANGELOG + the tag + GitHub release.
+- When it cuts a release, the **GoReleaser** job in the same workflow builds the cross-platform archives, **GPG-signs** the checksums and **appends** them to the release (`release.mode: append`).
+- The registry consumes the per-platform zips + `SHA256SUMS` + detached `.sig` + `manifest.json` (protocol `6.0`, from `terraform-registry-manifest.json`).
+- The GPG key in `KEYS` is the **same** key the sibling providers use — already registered, nothing to rotate.
+
+## Conventions
+
+- **Conventional Commits enforced** via commitlint on `git commit`. Don't `--no-verify` unless explicitly asked.
+- Siblings **`../terraform-provider-laravelforge`**, **`../terraform-provider-discord`** and **`../terraform-provider-linear`** are the reference implementations of these provider conventions — check them when unsure.
 
 ## AI & skills
 
@@ -118,26 +187,10 @@ rm .github/workflows/promotion-pr.yml
 # .tituskirch-skills.json   — set `pr.base` to "main"
 ```
 
-Nothing is vendored for this. A variant worth shipping as files is one that *adds* something — content that would otherwise be lost. A variant that only deletes has nothing to preserve, so it stays documented, exactly like _Public vs private repos_ below.
+Nothing is vendored for this. A variant worth shipping as files is one that *adds* something — content that would otherwise be lost. A variant that only deletes has nothing to preserve, so it stays documented.
 
 `ci.yml` and `codeql.yml` list both `main` and `dev` in their `on: branches:` filters and neither edit touches them. A filter naming a branch that doesn't exist is a no-op, so it costs a main-only repo nothing — and without `dev` in `ci.yml`, PRs into `dev` (Dependabot's included) would run no CI at all.
 
-Variants that are *purely* deletions — see _Public vs private repos_ below — stay documented rather than vendored; only this one earns the folder.
-
-## Public vs private repos
-
-Some meta defaults only make sense for one visibility. When spinning up a repo from this template, adjust for its visibility:
-
-- **CodeQL / code scanning** (`.github/workflows/codeql.yml`) depends on GitHub Advanced Security. It's free on **public** repos; on a **private** repo without a GHAS license it won't run — delete `codeql.yml` (and the CodeQL note above) rather than leave a dead workflow. The same goes for other GHAS-gated features (secret scanning, etc.). Dependabot version updates work on both.
-- **License.** A **public** repo ships MIT: keep `LICENSE` and the `[MIT](LICENSE) © …` README footer. A **private** repo is proprietary: remove/replace `LICENSE`, drop the MIT footer, and set `package.json` to `"license": "UNLICENSED"` (keep `"private": true`).
-- **Discord forum links.** `.github/ISSUE_TEMPLATE/config.yml` points questions, ideas and possible bugs at the repo's Discord forum (each open-source repo gets one, provisioned from the `infrastructure` repo's OpenTofu). Confirmed bugs and features stay as the GitHub issue forms. A **private** repo has no forum — drop the `contact_links` block; if you still want an in-repo Q&A path, restore a simple `question.yml`.
-
 ## House style for READMEs and meta files
 
-`/write-readme` skill encodes the canonical structure. Key rules: hero block wrapped in `<div align="center">`, prescribed section emojis (✨ Features, 🚀 Setup, 🤝 Contributing, 🛣️ Versioning, 📄 License), license footer always reads `[MIT](LICENSE) © [Titus Kirch](https://github.com/TitusKirch/) / [IT-Dienstleistungen Titus Kirch](https://kirch.dev)`. Use GitHub callouts (`> [!TIP]`, `> [!IMPORTANT]`), never plain blockquotes.
-
-## When editing this template
-
-- Every file referencing `TitusKirch/scaffold` is a placeholder that downstream users will replace. Keep the references consistent so a single `grep -rn "TitusKirch/scaffold"` catches them all.
-- `forgemap` (sibling repo at `../forgemap`) is the de-facto reference implementation of these conventions. When unsure about a config choice, check what forgemap does.
-- The template's own `package.json` is `"private": true` and `"name": "scaffold"` — not published anywhere.
+`/write-readme` skill encodes the canonical structure. Key rules: hero block wrapped in `<div align="center">`, prescribed section emojis (✨ 📦 🗺️ 📚 🤝 🛣️ 📄), license footer always reads `[MIT](LICENSE) © [Titus Kirch](https://github.com/TitusKirch/) / [IT-Dienstleistungen Titus Kirch](https://kirch.dev)`. Use GitHub callouts (`> [!TIP]`, `> [!IMPORTANT]`), never plain blockquotes.
