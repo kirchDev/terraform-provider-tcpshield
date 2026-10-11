@@ -61,7 +61,7 @@ The published OpenAPI spec is loose — several single reads are documented as a
 
 ## Commands
 
-Go (via `GNUmakefile`; needs **Go ≥ 1.25** — `terraform-plugin-framework v1.19` requires it):
+Go (via `GNUmakefile`; needs **Go ≥ 1.26** — `golang.org/x/net` and friends require it). `go.mod` also pins `toolchain go1.26.9`: `setup-go` in CI and the release reads that line, and builds with an older 1.26 patch would ship a `net/http` with known vulnerabilities. Raise it when a newer Go patch fixes the standard library; keep it at a version the local `golangci-lint` was built with or newer.
 
 | Command        | What it does                                                                |
 | :------------- | :-------------------------------------------------------------------------- |
@@ -73,6 +73,7 @@ Go (via `GNUmakefile`; needs **Go ≥ 1.25** — `terraform-plugin-framework v1.
 | `make docs`    | render `docs/` from the schema (build + export + tfplugindocs)              |
 | `make test`    | `go test ./...` — client unit tests, examples coverage                      |
 | `make testacc` | `TF_ACC=1 go test ./...` — mock acceptance tests; needs a TF binary, no key |
+| `make vuln`    | `govulncheck ./...` — reachable vulnerabilities, standard library included  |
 
 **Live tests** (real API, real entities — a whole network is created and destroyed; needs an account with a free network slot):
 
