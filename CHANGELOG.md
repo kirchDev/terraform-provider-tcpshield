@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/kirchDev/terraform-provider-tcpshield/compare/v0.1.0...v0.1.1) (2026-10-12)
+
+
+### Bug Fixes
+
+* **deps:** update go module dependencies ([b2824ef](https://github.com/kirchDev/terraform-provider-tcpshield/commit/b2824ef8806daae6eafbf011d56960e01e1e49c4))
+
 ## 0.1.0 (2026-10-11)
 
 
