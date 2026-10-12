@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/kirchDev/terraform-provider-tcpshield/compare/v0.1.1...v0.1.2) (2026-10-12)
+
+
+### Bug Fixes
+
+* **deps:** move to go 1.27 ([ccfb805](https://github.com/kirchDev/terraform-provider-tcpshield/commit/ccfb8057c20f0028540b3ad9ad3eba2d30913b62))
+
 ## [0.1.1](https://github.com/kirchDev/terraform-provider-tcpshield/compare/v0.1.0...v0.1.1) (2026-10-12)
 
 
